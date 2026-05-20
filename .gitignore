@@ -1,0 +1,8 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ROS 2 e OS
+*.swp
+.DS_Store
