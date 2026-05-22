@@ -24,7 +24,8 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'test_driver = vessel_system.test_driver:main'
+            'test_driver = vessel_system.test_driver:main',
+            'pose_to_tf = vessel_system.pose_to_tf:main'    
         ],
     },
 )
