@@ -27,6 +27,7 @@ setup(
             'test_driver = vessel_system.test_driver:main',
             'pose_to_tf = vessel_system.pose_to_tf:main',
             'check_sonar_sensor = vessel_system.check_sonar_sensor:main',    
+            'teleop_wasd = vessel_system.teleop_wasd:main',
         ],
     },
 )
