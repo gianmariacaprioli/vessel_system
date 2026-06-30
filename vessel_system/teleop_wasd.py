@@ -12,25 +12,25 @@ msg = """
 --------------------------------------------------
 ASV Twin-Engine Teleop - Pilota Manuale
 --------------------------------------------------
-Controllo Diretto dei Motori (Tank Steer):
+Controllo Proporzionale dei Motori:
 
-        W : Accelera entrambi
-   A : Gira a SX   S : Frena/Indietro   D : Gira a DX
+        W : Aumenta velocità avanti
+   A : Gira a SX   S : Riduci velocità / Retromarcia   D : Gira a DX
 
-Spazio o X : Azzera le manette (Motori a 0)
-CTRL+C     : Esci dal pilota automatico
+Spazio o X : Azzera i motori (Fermo)
+CTRL+C     : Esci dal programma
 
-Nota: La spinta non si azzera da sola. È come una vera manetta!
+Nota: La manetta rimane impostata anche se rilasci il tasto!
 --------------------------------------------------
 """
 
-# Configurazione della spinta
-MAX_THRUST = 100000000.0    # Spinta massima applicabile a un singolo motore (Newton)
-THRUST_STEP = 500.0     # Quanto aumenta la spinta lineare a ogni pressione di W/S
-TURN_STEP =  1500.0     # Spinta di sterzata (Aumentata per vincere l'attrito dell'acqua)
+# Configurazione della spinta (Bilanciata per la fisica di Gazebo)
+MAX_THRUST = 30000.0     # Impostiamo un limite reale sensato rispetto a prima
+BACKWARD_THRUST = 10000.0 
+THRUST_STEP = 500.0     # Incremento della spinta lineare (W/S)
+TURN_STEP = 1000.0       # Intensità della sterzata (A/D)
 
 def get_key(settings):
-    """Cattura il singolo tasto premuto sul terminale"""
     tty.setraw(sys.stdin.fileno())
     rlist, _, _ = select.select([sys.stdin], [], [], 0.1)
     if rlist:
@@ -44,79 +44,85 @@ class TwinEngineTeleop(Node):
     def __init__(self):
         super().__init__('teleop_wasd_twin_engine')
         
-        # Publisher separati per il motore sinistro e destro
         self.pub_left = self.create_publisher(Float64, '/model/vessel_v2/joint/left_engine_joint/cmd_thrust', 10)
         self.pub_right = self.create_publisher(Float64, '/model/vessel_v2/joint/right_engine_joint/cmd_thrust', 10)
         
-        # Manette reali dei due motori
-        self.thrust_left = 0.0
-        self.thrust_right = 0.0
+        # Gestiamo due stati separati: spinta lineare e offset di virata
+        self.linear_val = 0.0
+        self.angular_val = 0.0
         
-        self.get_logger().info("Motori accesi! Pronto a navigare.")
+        self.get_logger().info("Motori pronti! Usa WASD per navigare.")
 
     def update_thrust(self, key):
-        # Accelerazione (Entrambi i motori avanti)
+        # W: Aumenta la spinta in avanti
         if key == 'w' or key == 'W':
-            self.thrust_left = min(self.thrust_left + THRUST_STEP, MAX_THRUST)
-            self.thrust_right = min(self.thrust_right + THRUST_STEP, MAX_THRUST)
+            self.linear_val = min(self.linear_val + THRUST_STEP, MAX_THRUST)
             
-        # Frenata/Retromarcia (Entrambi i motori indietro)
+        # S: Diminuisce la spinta avanti / va in retromarcia
         elif key == 's' or key == 'S':
-            self.thrust_left = max(self.thrust_left - THRUST_STEP, -MAX_THRUST)
-            self.thrust_right = max(self.thrust_right - THRUST_STEP, -MAX_THRUST)
+            self.linear_val = max(self.linear_val - THRUST_STEP, -BACKWARD_THRUST)
             
-        # Virata a Sinistra: Motore Destro spinge, Motore Sinistro frena
+        # A: Modifica l'asse per curvare a Sinistra (Motore DX spinge di più, SX di meno)
         elif key == 'a' or key == 'A':
-            self.thrust_left = min(self.thrust_left - TURN_STEP, -MAX_THRUST)
-            self.thrust_right = max(self.thrust_right + TURN_STEP, MAX_THRUST)
+            self.angular_val = min(self.angular_val + TURN_STEP, MAX_THRUST)
             
-        # Virata a Destra: Motore Sinistro spinge, Motore Destro frena
+        # D: Modifica l'asse per curvare a Destra (Motore SX spinge di più, DX di meno)
         elif key == 'd' or key == 'D':
-            self.thrust_left = max(self.thrust_left + TURN_STEP, MAX_THRUST)
-            self.thrust_right = min(self.thrust_right - TURN_STEP, -MAX_THRUST)
+            self.angular_val = max(self.angular_val - TURN_STEP, -MAX_THRUST)
             
-        # Stop d'emergenza
+        # Stop d'emergenza (X o Spazio)
         elif key == ' ' or key == 'x' or key == 'X':
-            self.thrust_left = 0.0
-            self.thrust_right = 0.0
+            self.linear_val = 0.0
+            self.angular_val = 0.0
+            
+        else:
+            # Se premi altri tasti (o rilasci), riduciamo gradualmente l'angolo di sterzata 
+            # per far tornare la barca dritta, mantenendo però la velocità lineare (Manetta aperta)
+            self.angular_val *= 0.5
+            if abs(self.angular_val) < 10.0:
+                self.angular_val = 0.0
 
-        # Pubblicazione sui topic
+        # Mixaggio della spinta differenziale
+        thrust_left = self.linear_val + self.angular_val
+        thrust_right = self.linear_val - self.angular_val
+        total_thrust = thrust_left + thrust_right
+
+        # Clip finale di sicurezza per evitare di superare i limiti fisici del motore
+        thrust_left = max(min(thrust_left, MAX_THRUST), -MAX_THRUST)
+        thrust_right = max(min(thrust_right, MAX_THRUST), -MAX_THRUST)
+
+        # Invio comandi a Gazebo
         msg_l = Float64()
-        msg_l.data = self.thrust_left
+        msg_l.data = thrust_left
         msg_r = Float64()
-        msg_r.data = self.thrust_right
+        msg_r.data = thrust_right
         
         self.pub_left.publish(msg_l)
         self.pub_right.publish(msg_r)
         
-        # Stampa a schermo per farti capire esattamente cosa stanno facendo i motori
-        print(f"Motore SX: {self.thrust_left:7.1f} N  |  Motore DX: {self.thrust_right:7.1f} N   ", end="\r")
+        # Output di debug pulito
+        print(f"Manetta: {total_thrust:7.1f} N | Motore SX: {thrust_left:7.1f} N | Motore DX: {thrust_right:7.1f} N   ", end="\r")
 
 def main(args=None):
     rclpy.init(args=args)
     settings = termios.tcgetattr(sys.stdin)
-    
     node = TwinEngineTeleop()
     print(msg)
     
     try:
         while rclpy.ok():
             key = get_key(settings)
-            if key: # Aggiorna la spinta SOLO se viene premuto un tasto
-                node.update_thrust(key)
-            if key == '\x03': # Intercetta il CTRL+C per uscire
+            # Chiamiamo l'update sempre, così se non premi nulla la sterzata torna al centro stabilizzandosi
+            node.update_thrust(key)
+            if key == '\x03': # CTRL+C
                 break
-                
     except Exception as e:
-        print(f"Errore: {e}")
-        
+        print(f"\nErrore: {e}")
     finally:
-        # Ferma i motori quando chiudi lo script
         stop_msg = Float64()
         stop_msg.data = 0.0
         node.pub_left.publish(stop_msg)
         node.pub_right.publish(stop_msg)
-        
         termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, settings)
         node.destroy_node()
         rclpy.shutdown()
