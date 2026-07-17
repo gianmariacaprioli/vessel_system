@@ -29,6 +29,9 @@ setup(
             'check_sonar_sensor = vessel_system.check_sonar_sensor:main',    
             'teleop_wasd = vessel_system.teleop_wasd:main',
             'gps_velocity = vessel_system.gps_velocity:main', 
+            'controller_node = vessel_system.controller_node:main',    
+            'motor_mixer = vessel_system.motor_mixer:main',
+            'waypoint_manager_node = vessel_system.waypoint_manager_node:main',
         ],
     },
 )
