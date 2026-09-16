@@ -16,7 +16,7 @@ class WaypointManager(Node):
         self.waypoints_gps = [
             (36.509800, -6.262500), 
             (36.510500, -6.261000), 
-            (36.508000, -6.260000)  
+            (36.509250, -6.260360)  
         ]
         
         # Converti i target in Metri all'avvio

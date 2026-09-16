@@ -32,6 +32,7 @@ setup(
             'controller_node = vessel_system.controller_node:main',    
             'motor_mixer = vessel_system.motor_mixer:main',
             'waypoint_manager_node = vessel_system.waypoint_manager_node:main',
+            'x500wp_manager = vessel_system.x500wp_manager:main',
         ],
     },
 )
