@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+
+set -u
+
+SESSION="${1:-}"
+
+if [[ -z "$SESSION" ]]; then
+    if [[ -z "${TMUX:-}" ]]; then
+        echo "ERROR: tkill must be run from inside the tmux simulation session."
+        exit 1
+    fi
+
+    SESSION="$(tmux display-message -p '#S')"
+fi
+
+if [[ "${TKILL_DETACHED:-0}" != "1" ]]; then
+    # The shutdown worker must live outside tmux; otherwise it would terminate
+    # itself while closing the pane from which tkill was invoked.
+    TKILL_DETACHED=1 setsid "$0" "$SESSION" \
+        >"/tmp/${SESSION}_shutdown.log" 2>&1 </dev/null &
+
+    echo "Stopping tmux session '$SESSION'..."
+    echo "Shutdown log: /tmp/${SESSION}_shutdown.log"
+    exit 0
+fi
+
+if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+    exit 0
+fi
+
+# Ask every foreground process to stop cleanly. This lets ros2 launch forward
+# SIGINT to Gazebo, RViz, bridges and the remaining ROS nodes.
+while IFS= read -r pane; do
+    tmux send-keys -t "$pane" C-c 2>/dev/null || true
+done < <(tmux list-panes -t "$SESSION" -F '#{pane_id}')
+
+# Give ros2 launch time to reap its child processes.
+for _ in {1..10}; do
+    sleep 0.5
+
+    if ! pgrep -f 'ros2 launch asv_simulator sim.launch.py' >/dev/null 2>&1 && \
+       ! pgrep -f 'gz sim .*ocean_world.sdf' >/dev/null 2>&1; then
+        break
+    fi
+done
+
+tmux kill-session -t "$SESSION" 2>/dev/null || true
+
+# Clean up only orphaned processes belonging to this simulator. Normal runs
+# should already have stopped during the grace period above.
+while IFS= read -r pid; do
+    [[ "$pid" == "$$" ]] || kill -INT "$pid" 2>/dev/null || true
+done < <(pgrep -f 'ros2 launch asv_simulator sim.launch.py' || true)
+
+while IFS= read -r pid; do
+    [[ "$pid" == "$$" ]] || kill -INT "$pid" 2>/dev/null || true
+done < <(pgrep -f 'gz sim .*ocean_world.sdf' || true)
+

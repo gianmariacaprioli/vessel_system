@@ -2,6 +2,8 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
 # ============================================================================
 # USV / UAV SIMULATION STARTUP
 # Creates one tmux session with:
@@ -50,6 +52,13 @@ fi
 # server.
 printf -v DISPLAY_VALUE '%q' "${DISPLAY:-:0}"
 SOURCE_CMD="export DISPLAY=$DISPLAY_VALUE"
+
+printf -v SCRIPT_DIR_VALUE '%q' "$SCRIPT_DIR"
+SOURCE_CMD+=" && export PATH=$SCRIPT_DIR_VALUE:\$PATH"
+
+# Keep this simulation isolated from Gazebo instances running in other
+# containers on the same host network.
+SOURCE_CMD+=" && export GZ_PARTITION=asv_simulator"
 
 if [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
     printf -v XDG_RUNTIME_DIR_VALUE '%q' "$XDG_RUNTIME_DIR"
