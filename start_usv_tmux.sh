@@ -4,29 +4,57 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
-# ============================================================================
-# USV / UAV SIMULATION STARTUP
-# Creates one tmux session with:
+# Default: run the Nautilus mission through the three red markers in ocean_world.
+# Flags can be combined.
+#   ./start_usv_tmux.sh --headless --detach
+#   ./start_usv_tmux.sh --rviz            # Gazebo plus RViz
+#   ./start_usv_tmux.sh --rviz-only       # RViz with the Gazebo server in background
+#   ./start_usv_tmux.sh --vessel-v2 --x500  # both USVs plus the UAV
+#   ./start_usv_tmux.sh --no-nautilus --vessel-v2
 #
-#   1. Control terminal
-#   2. Gazebo / ROS simulation
-#   3. X500 waypoint manager
-#   4. Motor mixer
-#   5. Controller
-#   6. USV waypoint manager
-#
-# Startup sequence:
-#
-#   t = 0 s   -> Simulation
-#   t = 10 s  -> X500 waypoint manager
-#   t = 12 s  -> Motor mixer + Controller
-#   t = 42 s  -> USV waypoint manager
-# ============================================================================
+# Model flags enable both the Gazebo spawn and the matching control chain:
+#   Nautilus / vessel_v2 -> surface_control.launch.py and one waypoint manager
+#                           per model, isolated by ROS namespace.
+#   X500               -> x500wp_manager
+#   BlueROV2 Heavy     -> uuv_controller in waypoint mode
+#   DURIUS             -> spawn only (no controller configured here).
+# To test manual surface waypoints, stop that boat's waypoint-manager pane
+# and publish geometry_msgs/msg/Point to /<model>/target_waypoint.
+# Both managers accept waypoints_xy to override the mission. These are x/y
+# pairs in metres in ocean_world, regardless of the model's spawn position.
 
+SESSION="${USV_SIM_SESSION:-usv_sim}"
+NAUTILUS=true
+VESSEL_V2=false
+X500=false
+UUV=false
+DURIUS=false
+HEADLESS=false
+START_GZ_GUI=true
+START_RVIZ=false
+RVIZ_CONFIG=vessel_viz.rviz
+DETACH=false
 
-# Tmux session name
-SESSION="usv_sim"
-
+for option in "$@"; do
+    case "$option" in
+        --nautilus) NAUTILUS=true ;;
+        --no-nautilus) NAUTILUS=false ;;
+        --vessel-v2) VESSEL_V2=true ;;
+        --x500) X500=true ;;
+        --uuv) UUV=true ;;
+        --durius) DURIUS=true ;;
+        --headless) HEADLESS=true ;;
+        --rviz) START_GZ_GUI=true; START_RVIZ=true; RVIZ_CONFIG=vessel_viz.rviz ;;
+        --rviz-only) START_GZ_GUI=false; START_RVIZ=true; RVIZ_CONFIG=surface_tracking.rviz ;;
+        --no-rviz) START_RVIZ=false ;;
+        --detach) DETACH=true ;;
+        -h|--help)
+            echo "Usage: $0 [--no-nautilus|--nautilus] [--vessel-v2] [--x500] [--uuv] [--durius] [--headless] [--rviz|--rviz-only|--no-rviz] [--detach]"
+            echo "Nautilus and its automatic mission through the three red markers are enabled by default."
+            exit 0 ;;
+        *) echo "Unknown option: $option" >&2; exit 2 ;;
+    esac
+done
 
 # ============================================================================
 # CHECK TMUX
@@ -56,9 +84,20 @@ SOURCE_CMD="export DISPLAY=$DISPLAY_VALUE"
 printf -v SCRIPT_DIR_VALUE '%q' "$SCRIPT_DIR"
 SOURCE_CMD+=" && export PATH=$SCRIPT_DIR_VALUE:\$PATH"
 
-# Keep this simulation isolated from Gazebo instances running in other
-# containers on the same host network.
-SOURCE_CMD+=" && export GZ_PARTITION=asv_simulator"
+# Inherited by child processes even if they detach from their launch pane.
+read -r SIM_RUN_ID < /proc/sys/kernel/random/uuid
+SOURCE_CMD+=" && export ASV_SIM_RUN_ID=$SIM_RUN_ID"
+
+# Isolate discovery from previous runs and other Gazebo instances. Set
+# GZ_PARTITION explicitly only when an external Gazebo client must share it.
+SIM_PARTITION="${GZ_PARTITION:-asv_simulator_$SIM_RUN_ID}"
+printf -v GZ_PARTITION_VALUE '%q' "$SIM_PARTITION"
+SOURCE_CMD+=" && export GZ_PARTITION=$GZ_PARTITION_VALUE"
+
+if [[ -n "${XAUTHORITY:-}" ]]; then
+    printf -v XAUTHORITY_VALUE '%q' "$XAUTHORITY"
+    SOURCE_CMD+=" && export XAUTHORITY=$XAUTHORITY_VALUE"
+fi
 
 if [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
     printf -v XDG_RUNTIME_DIR_VALUE '%q' "$XDG_RUNTIME_DIR"
@@ -98,8 +137,7 @@ fi
 # If a tmux session with the same name already exists, close only that session.
 if tmux has-session -t "$SESSION" 2>/dev/null; then
     echo "Closing existing tmux session: $SESSION"
-    tmux kill-session -t "$SESSION"
-    sleep 1
+    TKILL_DETACHED=1 "$SCRIPT_DIR/tkill" "$SESSION"
 fi
 
 
@@ -109,9 +147,10 @@ fi
 
 # Create the tmux server and the first pane.
 # This first pane will be used as the empty control terminal.
-# A detached tmux session otherwise starts at 80x24. That is too small for six
-# panes and makes the last split fail with "no space for new pane".
-tmux new-session -d -x 240 -y 60 -s "$SESSION" -n "simulation"
+# Start with enough room for the optional model panes.
+SESSION_ID="$(tmux new-session -d -P -F '#{session_id}' \
+    -x 240 -y 60 -s "$SESSION" -n "simulation")"
+tmux set-option -t "$SESSION_ID" @asv_sim_run_id "$SIM_RUN_ID"
 
 # Make sure the session was actually created.
 if ! tmux has-session -t "$SESSION" 2>/dev/null; then
@@ -122,123 +161,41 @@ fi
 # Get the ID of the first pane.
 CONTROL_PANE=$(tmux display-message -p -t "$SESSION:simulation.0" '#{pane_id}')
 
+# Keep a pane for each enabled control chain. Retile after each split so
+# enabling several optional models does not exhaust the first pane's height.
+start_pane() {
+    local pane
+    pane=$(tmux split-window -d -t "$CONTROL_PANE" -P -F '#{pane_id}')
+    tmux select-layout -t "$SESSION:simulation" tiled
+    tmux send-keys -t "$pane" "$SOURCE_CMD && exec $1" C-m
+}
 
-# ============================================================================
-# CREATE THE OTHER FIVE TERMINALS
-# ============================================================================
+tmux send-keys -t "$CONTROL_PANE" "$SOURCE_CMD" C-m
 
-# Create terminal for Gazebo / simulation.
-SIM_PANE=$(tmux split-window \
-    -d \
-    -t "$CONTROL_PANE" \
-    -P \
-    -F '#{pane_id}')
+# The managers wait for GPS/odometry and republish the current waypoint.
+# The controllers wait for feedback, so fixed startup sleeps are unnecessary.
+start_pane "ros2 launch asv_simulator sim.launch.py headless:=$HEADLESS start_gz_gui:=$START_GZ_GUI start_rviz:=$START_RVIZ rviz_config:=$RVIZ_CONFIG spawn_nautilus:=$NAUTILUS spawn_vessel_v2:=$VESSEL_V2 spawn_uav:=$X500 spawn_uuv:=$UUV spawn_durius:=$DURIUS"
 
-# Create terminal for X500 waypoint manager.
-X500_WP_PANE=$(tmux split-window \
-    -d \
-    -t "$CONTROL_PANE" \
-    -P \
-    -F '#{pane_id}')
+if [[ "$NAUTILUS" == true || "$VESSEL_V2" == true ]]; then
+    start_pane "ros2 launch vessel_system surface_control.launch.py control_nautilus_vessel:=$NAUTILUS control_vessel_v2:=$VESSEL_V2"
+fi
+if [[ "$NAUTILUS" == true ]]; then
+    start_pane "ros2 run vessel_system waypoint_manager_node --ros-args -r __ns:=/nautilus_vessel -p model:=nautilus_vessel"
+fi
+if [[ "$VESSEL_V2" == true ]]; then
+    start_pane "ros2 run vessel_system waypoint_manager_node --ros-args -r __ns:=/vessel_v2 -p model:=vessel_v2"
+fi
+if [[ "$X500" == true ]]; then
+    start_pane "ros2 run vessel_system x500wp_manager"
+fi
+if [[ "$UUV" == true ]]; then
+    start_pane "ros2 run vessel_system uuv_controller --ros-args -p mode:=waypoint"
+fi
 
-# Create terminal for motor mixer.
-MOTOR_MIXER_PANE=$(tmux split-window \
-    -d \
-    -t "$CONTROL_PANE" \
-    -P \
-    -F '#{pane_id}')
-
-# Create terminal for controller.
-CONTROLLER_PANE=$(tmux split-window \
-    -d \
-    -t "$CONTROL_PANE" \
-    -P \
-    -F '#{pane_id}')
-
-# Create terminal for USV waypoint manager.
-USV_WP_PANE=$(tmux split-window \
-    -d \
-    -t "$CONTROL_PANE" \
-    -P \
-    -F '#{pane_id}')
-
-
-# Arrange all six terminals automatically.
-tmux select-layout -t "$SESSION:simulation" tiled
-
-
-# ============================================================================
-# TERMINAL 1 - CONTROL
-# ============================================================================
-
-# Empty control terminal.
-# Both ROS 2 workspaces are already sourced and it is ready for manual commands.
-tmux send-keys -t "$CONTROL_PANE" \
-    "$SOURCE_CMD && clear && echo '[CONTROL] ROS 2 workspaces sourced. Terminal ready.'" \
-    C-m
-
-
-# ============================================================================
-# TERMINAL 2 - SIMULATION
-# t = 0 seconds
-# ============================================================================
-
-# Start Gazebo and the ROS 2 simulation immediately.
-tmux send-keys -t "$SIM_PANE" \
-    "$SOURCE_CMD && echo '[SIMULATION] Starting simulation...' && exec ros2 launch asv_simulator sim.launch.py" \
-    C-m
-
-
-# ============================================================================
-# TERMINAL 3 - X500 WAYPOINT MANAGER
-# t = 10 seconds
-# ============================================================================
-
-# Wait for Gazebo and ROS interfaces to initialize before starting UAV control.
-tmux send-keys -t "$X500_WP_PANE" \
-    "$SOURCE_CMD && echo '[X500 WP] Waiting 10 seconds...' && sleep 10 && echo '[X500 WP] Starting...' && exec ros2 run vessel_system x500wp_manager" \
-    C-m
-
-
-# ============================================================================
-# TERMINAL 4 - MOTOR MIXER
-# t = 12 seconds
-# ============================================================================
-
-# Start two seconds after the X500 waypoint manager.
-tmux send-keys -t "$MOTOR_MIXER_PANE" \
-    "$SOURCE_CMD && echo '[MOTOR MIXER] Waiting 12 seconds...' && sleep 12 && echo '[MOTOR MIXER] Starting...' && exec ros2 run vessel_system motor_mixer" \
-    C-m
-
-
-# ============================================================================
-# TERMINAL 5 - CONTROLLER
-# t = 12 seconds
-# ============================================================================
-
-# Start simultaneously with the motor mixer.
-tmux send-keys -t "$CONTROLLER_PANE" \
-    "$SOURCE_CMD && echo '[CONTROLLER] Waiting 12 seconds...' && sleep 12 && echo '[CONTROLLER] Starting...' && exec ros2 run vessel_system controller_node" \
-    C-m
-
-
-# ============================================================================
-# TERMINAL 6 - USV WAYPOINT MANAGER
-# t = 22 seconds
-# ============================================================================
-
-# Start ten seconds after motor mixer and controller.
-tmux send-keys -t "$USV_WP_PANE" \
-    "$SOURCE_CMD && echo '[USV WP] Waiting 42 seconds...' && sleep 42 && echo '[USV WP] Starting...' && exec ros2 run vessel_system waypoint_manager_node" \
-    C-m
-
-
-# ============================================================================
-# ATTACH TO SESSION
-# ============================================================================
-
-# Select the empty control terminal by default.
 tmux select-pane -t "$CONTROL_PANE"
-
-# Attach to the newly created tmux session.
-tmux attach-session -t "$SESSION"
+if [[ "$DETACH" == true ]]; then
+    echo "Simulation started. Attach with: tmux attach-session -t $SESSION"
+    echo "Gazebo partition: $SIM_PARTITION"
+else
+    tmux attach-session -t "$SESSION"
+fi

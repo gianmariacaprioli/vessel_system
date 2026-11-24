@@ -5,6 +5,8 @@ from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Point, Wrench
 import math
 
+from .surface_models import declare_model
+
 class ControllerNode(Node):
     def __init__(self):
         super().__init__('controller_node')
@@ -12,14 +14,10 @@ class ControllerNode(Node):
         self.lat_ref = 36.509513
         self.lon_ref = -6.263074
 
-        # --- PARAMETRI FISICI (Dal tuo file SDF) ---
-        self.mass = 55000.0 # kg
-        # Surge Drag (Resistenza in X)
-        self.xU = -2750.0
-        self.xUabsU = -1500.0
-        # Yaw Drag (Resistenza in Rotazione Z)
-        self.nR = -60922.0
-        self.nRabsR = -283000.0
+        model, profile = declare_model(self)
+        for name in ('mass', 'xU', 'xUabsU', 'nR', 'nRabsR', 'kp_surge',
+                     'kd_surge', 'kp_yaw', 'kd_yaw', 'max_speed', 'use_gps'):
+            setattr(self, name, self.declare_parameter(name, profile[name]).value)
         
         # --- MODELLO MASSA-MOLLA-SMORZATORE ---
         self.wp_initial_distance = 0.0 # Il nostro "target" (Distanza totale da percorrere)
@@ -27,16 +25,14 @@ class ControllerNode(Node):
         self.v_d = 0.0  # Velocità della traiettoria ideale
         
         # Frequenza naturale (omega_n) e smorzamento (zeta)
-        self.omega_n = 0.1 # Più è basso, più l'accelerazione è dolce
+        self.omega_n = self.declare_parameter('omega_n', profile.get('omega_n', 0.1)).value
+        self.yaw_drag_feedforward = self.declare_parameter(
+            'yaw_drag_feedforward', profile.get('yaw_drag_feedforward', 1.0)).value
+        self.approach_gain = self.declare_parameter(
+            'approach_gain', profile.get('approach_gain', 0.0)).value
+        self.waypoint_tolerance = self.declare_parameter(
+            'waypoint_tolerance', profile.get('waypoint_tolerance', 0.0)).value
         self.zeta = 1.0    # Smorzamento critico (nessuna oscillazione)
-        
-        # --- GUADAGNI PID ---
-        # Avendo un Feedforward perfetto, i Kp possono essere più bassi e stabili
-        self.kp_surge = 2000.0
-        self.kd_surge = 5000.0
-        
-        self.kp_yaw = 40000.0 # Lo yaw serve alto per vincere l'inerzia della rotazione
-        self.kd_yaw = 20000.0
         
         # Stato nave
         self.current_x = 0.0
@@ -48,14 +44,19 @@ class ControllerNode(Node):
         self.target_x = 0.0
         self.target_y = 0.0
         self.target_received = False
-        self.gps_received = False
+        self.waypoint_reached = False
+        self.position_received = False
+        self.odom_received = False
         self.dt = 0.1
         
         # Sottoscrizioni
-        self.gps_sub = self.create_subscription(NavSatFix, '/vessel_v2/gps/fix', self.gps_callback, 10)
-        self.odom_sub = self.create_subscription(Odometry, '/model/vessel_v2/odometry', self.odom_callback, 10)
-        self.target_sub = self.create_subscription(Point, '/target_waypoint', self.target_callback, 10)
-        self.wrench_pub = self.create_publisher(Wrench, '/commanded_wrench', 10)
+        if self.use_gps:
+            gps_topic = self.declare_parameter('gps_topic', f'/{model}/gps/fix').value
+            self.gps_sub = self.create_subscription(NavSatFix, gps_topic, self.gps_callback, 10)
+        odom_topic = self.declare_parameter('odom_topic', f'/model/{model}/odometry').value
+        self.odom_sub = self.create_subscription(Odometry, odom_topic, self.odom_callback, 10)
+        self.target_sub = self.create_subscription(Point, 'target_waypoint', self.target_callback, 10)
+        self.wrench_pub = self.create_publisher(Wrench, 'commanded_wrench', 10)
         
         self.timer = self.create_timer(self.dt, self.control_loop)
 
@@ -68,8 +69,10 @@ class ControllerNode(Node):
         return x, y
 
     def gps_callback(self, msg):
+        if not all(map(math.isfinite, (msg.latitude, msg.longitude))):
+            return
         self.current_x, self.current_y = self.latlon_to_enu(msg.latitude, msg.longitude)
-        self.gps_received = True
+        self.position_received = True
 
     def euler_from_quaternion(self, q):
         siny_cosp = 2 * (q.w * q.z + q.x * q.y)
@@ -77,27 +80,49 @@ class ControllerNode(Node):
         return math.atan2(siny_cosp, cosy_cosp)
 
     def odom_callback(self, msg):
+        if not self.use_gps:
+            self.current_x = msg.pose.pose.position.x
+            self.current_y = msg.pose.pose.position.y
+            self.position_received = True
+        self.odom_received = True
         self.current_yaw = self.euler_from_quaternion(msg.pose.pose.orientation)
         self.current_u = msg.twist.twist.linear.x 
         self.current_r = msg.twist.twist.angular.z 
 
     def target_callback(self, msg):
+        if not all(map(math.isfinite, (msg.x, msg.y))):
+            return
         # Se riceviamo un NUOVO waypoint, resettiamo il modello di riferimento
-        if msg.x != self.target_x or msg.y != self.target_y:
+        if not self.target_received or msg.x != self.target_x or msg.y != self.target_y:
             self.target_x = msg.x
             self.target_y = msg.y
             
             # 1. Il target del modello diventa la distanza totale fino al waypoint
-            self.wp_initial_distance = math.hypot(self.target_x - self.current_x, self.target_y - self.current_y)
+            self.wp_initial_distance = None
             
             # 2. Resettiamo le condizioni iniziali della molla
             self.x_d = 0.0
-            self.v_d = self.current_u
             self.target_received = True
+            self.waypoint_reached = False
 
     def control_loop(self):
-        if not self.target_received or not self.gps_received:
+        if not (self.target_received and self.position_received and self.odom_received):
             return
+
+        distance = math.hypot(self.target_x - self.current_x,
+                              self.target_y - self.current_y)
+        if self.waypoint_tolerance > 0.0 and distance <= self.waypoint_tolerance:
+            self.waypoint_reached = True
+        if self.waypoint_reached:
+            wrench = Wrench()
+            wrench.force.x = -self.kd_surge * self.current_u
+            wrench.torque.z = -self.kd_yaw * self.current_r
+            self.wrench_pub.publish(wrench)
+            return
+
+        if self.wp_initial_distance is None:
+            self.wp_initial_distance = distance
+            self.v_d = self.current_u
 
         # ----------------------------------------------------
         # 1. ERRORE YAW (Rotazione verso il bersaglio)
@@ -119,10 +144,14 @@ class ControllerNode(Node):
         
         # Saturazione accelerazione (evita picchi assurdi all'avvio)
         a_d = max(min(a_d, 0.5), -0.5) 
+        if self.approach_gain > 0.0:
+            approach_speed = min(self.max_speed, self.approach_gain * distance)
+            speed_limit_accel = (approach_speed - self.v_d) / self.dt
+            a_d = max(-0.5, min(a_d, speed_limit_accel))
 
         # Integrazione di Eulero (Equazioni cinematiche)
         self.v_d += a_d * self.dt
-        self.v_d = max(min(self.v_d, 5.0), 0.0) # Saturo a max 5 m/s, vietata retromarcia
+        self.v_d = max(min(self.v_d, self.max_speed), 0.0)
         self.x_d += self.v_d * self.dt
 
         # ----------------------------------------------------
@@ -138,14 +167,13 @@ class ControllerNode(Node):
         drag_yaw = (self.nR * self.current_r) + (self.nRabsR * abs(self.current_r) * self.current_r)
         
         # Tau FF (Rotazione): Annulliamo l'attrito dell'acqua
-        tau_FF_yaw = -drag_yaw 
+        tau_FF_yaw = -self.yaw_drag_feedforward * drag_yaw
 
         # ----------------------------------------------------
         # 4. FEEDBACK (PID per correggere disturbi esterni)
         # ----------------------------------------------------
         # Quanta distanza REALE abbiamo percorso?
-        current_dist_to_wp = math.hypot(self.target_x - self.current_x, self.target_y - self.current_y)
-        actual_distance_traveled = self.wp_initial_distance - current_dist_to_wp
+        actual_distance_traveled = self.wp_initial_distance - distance
         
         # Errore rispetto al modello (Molla virtuale)
         error_x = self.x_d - actual_distance_traveled
@@ -163,7 +191,7 @@ class ControllerNode(Node):
         self.wrench_pub.publish(wrench_msg)
         
         # Log di debug
-        self.get_logger().info(f"Dist. Reale: {actual_distance_traveled:.1f} | Dist. Ideale (x_d): {self.x_d:.1f} | v_d: {self.v_d:.1f}")
+        self.get_logger().debug(f"Dist. Reale: {actual_distance_traveled:.1f} | Dist. Ideale (x_d): {self.x_d:.1f} | v_d: {self.v_d:.1f}")
 
 def main(args=None):
     rclpy.init(args=args)
