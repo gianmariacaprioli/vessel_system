@@ -85,9 +85,17 @@ class UuvController(Node):
         self.depth_tolerance = float(
             self.get_parameter('depth_tolerance').value)
 
+        waypoint_values = self.declare_parameter(
+            'waypoints_gps_depth',
+            [value for waypoint in WAYPOINTS_GPS_DEPTH for value in waypoint],
+        ).value
+        if (not waypoint_values or len(waypoint_values) % 3
+                or not all(math.isfinite(value) for value in waypoint_values)):
+            raise ValueError('waypoints_gps_depth must contain finite latitude/longitude/depth triples')
+        mission = zip(waypoint_values[::3], waypoint_values[1::3], waypoint_values[2::3])
         self.waypoints = [
             (*self.gps_to_enu(lat, lon), depth)
-            for lat, lon, depth in WAYPOINTS_GPS_DEPTH
+            for lat, lon, depth in mission
         ]
         self.waypoint_index = 0
         self.mission_complete = False

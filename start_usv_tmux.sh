@@ -22,6 +22,8 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # and publish geometry_msgs/msg/Point to /<model>/target_waypoint.
 # Both managers accept waypoints_xy to override the mission. These are x/y
 # pairs in metres in ocean_world, regardless of the model's spawn position.
+# Pass --external-control=<model> to reserve its actuators for an external
+# controller. The model must also be enabled using its spawn flag.
 
 SESSION="${USV_SIM_SESSION:-usv_sim}"
 NAUTILUS=true
@@ -34,6 +36,7 @@ START_GZ_GUI=true
 START_RVIZ=false
 RVIZ_CONFIG=vessel_viz.rviz
 DETACH=false
+declare -A EXTERNAL_CONTROL=()
 
 for option in "$@"; do
     case "$option" in
@@ -43,6 +46,8 @@ for option in "$@"; do
         --x500) X500=true ;;
         --uuv) UUV=true ;;
         --durius) DURIUS=true ;;
+        --external-control=vessel_v2|--external-control=nautilus_vessel|--external-control=x500|--external-control=uuv_bluerov2_heavy)
+            EXTERNAL_CONTROL["${option#*=}"]=true ;;
         --headless) HEADLESS=true ;;
         --rviz) START_GZ_GUI=true; START_RVIZ=true; RVIZ_CONFIG=vessel_viz.rviz ;;
         --rviz-only) START_GZ_GUI=false; START_RVIZ=true; RVIZ_CONFIG=surface_tracking.rviz ;;
@@ -51,10 +56,24 @@ for option in "$@"; do
         -h|--help)
             echo "Usage: $0 [--no-nautilus|--nautilus] [--vessel-v2] [--x500] [--uuv] [--durius] [--headless] [--rviz|--rviz-only|--no-rviz] [--detach]"
             echo "Nautilus and its automatic mission through the three red markers are enabled by default."
+            echo "--external-control=MODEL disables local control for an enabled model."
             exit 0 ;;
         *) echo "Unknown option: $option" >&2; exit 2 ;;
     esac
 done
+
+local_control() {
+    if [[ "$2" == true && "${EXTERNAL_CONTROL[$1]:-false}" == false ]]; then
+        printf true
+    else
+        printf false
+    fi
+}
+
+CONTROL_NAUTILUS=$(local_control nautilus_vessel "$NAUTILUS")
+CONTROL_VESSEL_V2=$(local_control vessel_v2 "$VESSEL_V2")
+CONTROL_X500=$(local_control x500 "$X500")
+CONTROL_UUV=$(local_control uuv_bluerov2_heavy "$UUV")
 
 # ============================================================================
 # CHECK TMUX
@@ -174,22 +193,22 @@ tmux send-keys -t "$CONTROL_PANE" "$SOURCE_CMD" C-m
 
 # The managers wait for GPS/odometry and republish the current waypoint.
 # The controllers wait for feedback, so fixed startup sleeps are unnecessary.
-start_pane "ros2 launch asv_simulator sim.launch.py headless:=$HEADLESS start_gz_gui:=$START_GZ_GUI start_rviz:=$START_RVIZ rviz_config:=$RVIZ_CONFIG spawn_nautilus:=$NAUTILUS spawn_vessel_v2:=$VESSEL_V2 spawn_uav:=$X500 spawn_uuv:=$UUV spawn_durius:=$DURIUS"
+start_pane "ros2 launch asv_simulator sim.launch.py headless:=$HEADLESS start_gz_gui:=$START_GZ_GUI start_rviz:=$START_RVIZ rviz_config:=$RVIZ_CONFIG spawn_nautilus:=$NAUTILUS spawn_vessel_v2:=$VESSEL_V2 spawn_uav:=$X500 x500_external_control:=${EXTERNAL_CONTROL[x500]:-false} spawn_uuv:=$UUV spawn_durius:=$DURIUS"
 
-if [[ "$NAUTILUS" == true || "$VESSEL_V2" == true ]]; then
-    start_pane "ros2 launch vessel_system surface_control.launch.py control_nautilus_vessel:=$NAUTILUS control_vessel_v2:=$VESSEL_V2"
+if [[ "$CONTROL_NAUTILUS" == true || "$CONTROL_VESSEL_V2" == true ]]; then
+    start_pane "ros2 launch vessel_system surface_control.launch.py control_nautilus_vessel:=$CONTROL_NAUTILUS control_vessel_v2:=$CONTROL_VESSEL_V2"
 fi
-if [[ "$NAUTILUS" == true ]]; then
+if [[ "$CONTROL_NAUTILUS" == true ]]; then
     start_pane "ros2 run vessel_system waypoint_manager_node --ros-args -r __ns:=/nautilus_vessel -p model:=nautilus_vessel"
 fi
-if [[ "$VESSEL_V2" == true ]]; then
+if [[ "$CONTROL_VESSEL_V2" == true ]]; then
     start_pane "ros2 run vessel_system waypoint_manager_node --ros-args -r __ns:=/vessel_v2 -p model:=vessel_v2"
 fi
-if [[ "$X500" == true ]]; then
+if [[ "$CONTROL_X500" == true ]]; then
     start_pane "ros2 run vessel_system x500wp_manager"
 fi
-if [[ "$UUV" == true ]]; then
-    start_pane "ros2 run vessel_system uuv_controller --ros-args -p mode:=waypoint"
+if [[ "$CONTROL_UUV" == true ]]; then
+    start_pane "ros2 run vessel_system uuv_controller --ros-args -p start_mode:=waypoint"
 fi
 
 tmux select-pane -t "$CONTROL_PANE"
