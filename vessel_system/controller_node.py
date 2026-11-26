@@ -30,6 +30,8 @@ class ControllerNode(Node):
             'yaw_drag_feedforward', profile.get('yaw_drag_feedforward', 1.0)).value
         self.approach_gain = self.declare_parameter(
             'approach_gain', profile.get('approach_gain', 0.0)).value
+        self.turn_braking_gain = self.declare_parameter('turn_braking_gain', 0.0).value
+        self.turn_heading_tolerance = self.declare_parameter('turn_heading_tolerance', 0.45).value
         self.waypoint_tolerance = self.declare_parameter(
             'waypoint_tolerance', profile.get('waypoint_tolerance', 0.0)).value
         self.zeta = 1.0    # Smorzamento critico (nessuna oscillazione)
@@ -115,14 +117,10 @@ class ControllerNode(Node):
             self.waypoint_reached = True
         if self.waypoint_reached:
             wrench = Wrench()
-            wrench.force.x = -self.kd_surge * self.current_u
+            wrench.force.x = -max(self.kd_surge, self.turn_braking_gain) * self.current_u
             wrench.torque.z = -self.kd_yaw * self.current_r
             self.wrench_pub.publish(wrench)
             return
-
-        if self.wp_initial_distance is None:
-            self.wp_initial_distance = distance
-            self.v_d = self.current_u
 
         # ----------------------------------------------------
         # 1. ERRORE YAW (Rotazione verso il bersaglio)
@@ -130,6 +128,20 @@ class ControllerNode(Node):
         desired_yaw = math.atan2(self.target_y - self.current_y, self.target_x - self.current_x)
         yaw_error = desired_yaw - self.current_yaw
         yaw_error = math.atan2(math.sin(yaw_error), math.cos(yaw_error))
+
+        # Close to obstacles, finish the turn before accelerating into the next leg.
+        if self.turn_braking_gain > 0.0 and abs(yaw_error) > self.turn_heading_tolerance:
+            wrench = Wrench()
+            wrench.force.x = -self.turn_braking_gain * self.current_u
+            wrench.torque.z = self.kp_yaw * yaw_error - self.kd_yaw * self.current_r
+            self.wrench_pub.publish(wrench)
+            self.wp_initial_distance = None
+            self.x_d = 0.0
+            return
+
+        if self.wp_initial_distance is None:
+            self.wp_initial_distance = distance
+            self.v_d = self.current_u
 
         # ----------------------------------------------------
         # 2. MODELLO DI RIFERIMENTO (Avanzamento X)

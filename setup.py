@@ -10,7 +10,13 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
-        ('share/' + package_name + '/launch', ['launch/surface_control.launch.py']),
+        ('share/' + package_name + '/launch', [
+            'launch/surface_control.launch.py',
+            'launch/durius_inspection.launch.py',
+            'launch/cadiz_bay_inspection.launch.py',
+            'launch/windturbine_takeoff.launch.py',
+            'launch/windturbine_inspection.launch.py',
+        ]),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -35,6 +41,8 @@ setup(
             'waypoint_manager_node = vessel_system.waypoint_manager_node:main',
             'x500wp_manager = vessel_system.x500wp_manager:main',
             'uuv_controller = vessel_system.uuv_controller:main',
+            'deck_takeoff = vessel_system.deck_takeoff:main',
+            'surface_path_follower = vessel_system.surface_path_follower:main',
         ],
     },
 )

@@ -20,6 +20,7 @@ class ControlAllocatorNode(Node):
                 raise ValueError(f'{name} must be finite and positive')
             setattr(self, name, value)
 
+        self.preserve_surge = self.declare_parameter('preserve_surge', False).value
         actuator_topic = self.declare_parameter(
             'actuator_topic', f'/{model}/command/motor_speed').value
         self.motor_pub = self.create_publisher(Actuators, actuator_topic, 10)
@@ -37,8 +38,17 @@ class ControlAllocatorNode(Node):
         command.header.stamp = self.get_clock().now().to_msg()
         if math.isfinite(surge) and math.isfinite(yaw):
             differential = yaw / (2.0 * self.lever_arm)
-            port = surge / 2.0 - differential
-            starboard = surge / 2.0 + differential
+            mean_thrust = surge / 2.0
+            if self.preserve_surge:
+                mean_thrust = max(-self.reverse_thrust, min(self.forward_thrust, mean_thrust))
+                # Saturate yaw symmetrically. Clipping each motor separately would
+                # create forward thrust during a turn because reverse is weaker.
+                yaw_margin = min(
+                    self.forward_thrust - mean_thrust, mean_thrust + self.reverse_thrust,
+                )
+                differential = max(-yaw_margin, min(yaw_margin, differential))
+            port = mean_thrust - differential
+            starboard = mean_thrust + differential
             command.velocity = [
                 self.thrust_to_command(port),
                 self.thrust_to_command(starboard),

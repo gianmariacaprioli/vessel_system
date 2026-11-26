@@ -18,6 +18,7 @@ from geometry_msgs.msg import Point
 from nav_msgs.msg import Odometry
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 
 
 # Mission waypoints: (latitude [deg], longitude [deg], depth [m]).
@@ -65,6 +66,8 @@ class UuvController(Node):
         self.declare_parameter('max_lateral_speed', 0.6)
         self.declare_parameter('max_vertical_speed', 0.35)
         self.declare_parameter('max_yaw_rate', 0.6)
+        self.surge_gain = self.declare_parameter('surge_gain', 1.1).value
+        self.yaw_rate_gain = self.declare_parameter('yaw_rate_gain', 1.0).value
         self.declare_parameter('waypoint_radius', 1.5)
         self.declare_parameter('depth_tolerance', 0.4)
 
@@ -85,18 +88,22 @@ class UuvController(Node):
         self.depth_tolerance = float(
             self.get_parameter('depth_tolerance').value)
 
-        waypoint_values = self.declare_parameter(
+        local_values = self.declare_parameter(
+            'waypoints_enu_depth', Parameter.Type.DOUBLE_ARRAY,
+        ).value
+        gps_values = self.declare_parameter(
             'waypoints_gps_depth',
             [value for waypoint in WAYPOINTS_GPS_DEPTH for value in waypoint],
         ).value
+        waypoint_values = local_values if local_values is not None else gps_values
         if (not waypoint_values or len(waypoint_values) % 3
                 or not all(math.isfinite(value) for value in waypoint_values)):
-            raise ValueError('waypoints_gps_depth must contain finite latitude/longitude/depth triples')
+            raise ValueError('UUV waypoints must contain finite position/depth triples')
         mission = zip(waypoint_values[::3], waypoint_values[1::3], waypoint_values[2::3])
-        self.waypoints = [
-            (*self.gps_to_enu(lat, lon), depth)
-            for lat, lon, depth in mission
-        ]
+        self.waypoints = (
+            list(mission) if local_values is not None else
+            [(*self.gps_to_enu(lat, lon), depth) for lat, lon, depth in mission]
+        )
         self.waypoint_index = 0
         self.mission_complete = False
 
@@ -296,7 +303,6 @@ class UuvController(Node):
                 f'{horizontal_distance:.2f} m, errore profondita='
                 f'{depth_error:.2f} m')
             self.waypoint_index += 1
-            self.depth_integral = 0.0
             return 0.0, 0.0, 0.0, target_depth
 
         desired_yaw = math.atan2(dy, dx)
@@ -333,7 +339,7 @@ class UuvController(Node):
             self.max_vertical_speed,
         )
         self.depth_integral = clamp(
-            self.depth_integral + error_z * self.dt, -2.0, 2.0)
+            self.depth_integral + error_z * self.dt, -5.0, 5.0)
         return clamp(
             1.5 * (desired_w - self.w) + 0.10 * self.depth_integral,
             -1.0,
@@ -343,18 +349,16 @@ class UuvController(Node):
     @staticmethod
     def allocate_thrusters(surge, sway, heave, yaw):
         """Allocate body commands to the BlueROV2 Heavy's eight thrusters."""
-        commands = [
+        horizontal = [
             surge + sway + yaw,
             surge - sway - yaw,
             surge - sway + yaw,
             surge + sway - yaw,
-            heave,
-            -heave,
-            -heave,
-            heave,
         ]
-        peak = max(1.0, max(abs(value) for value in commands))
-        return [value / peak for value in commands]
+        # The vertical thrusters can maintain depth while the horizontal
+        # thrusters saturate during a turn.
+        peak = max(1.0, max(abs(value) for value in horizontal))
+        return [value / peak for value in horizontal] + [heave, -heave, -heave, heave]
 
     def publish_motors(self, desired):
         max_step = self.motor_slew_rate * self.dt
@@ -385,6 +389,8 @@ class UuvController(Node):
                 self.waypoint_targets())
             if target_depth is None:
                 target_depth = -self.z
+            if target_depth != self.target_depth:
+                self.depth_integral = 0.0
             self.target_depth = target_depth
         else:
             target_u = self.manual_u
@@ -394,9 +400,9 @@ class UuvController(Node):
 
         # Inner velocity loops. Hydrodynamic damping remains simulated by
         # Gazebo; these gains only determine the demanded normalized thrust.
-        surge = clamp(1.1 * (target_u - self.u), -1.0, 1.0)
+        surge = clamp(self.surge_gain * (target_u - self.u), -1.0, 1.0)
         sway = clamp(1.3 * (target_v - self.v), -1.0, 1.0)
-        yaw = clamp(1.0 * (target_r - self.yaw_rate), -1.0, 1.0)
+        yaw = clamp(self.yaw_rate_gain * (target_r - self.yaw_rate), -1.0, 1.0)
         heave = self.depth_control(target_depth)
         self.publish_motors(
             self.allocate_thrusters(surge, sway, heave, yaw))
